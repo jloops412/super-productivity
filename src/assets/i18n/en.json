@@ -2096,7 +2096,7 @@
     },
     "TIME_TRACKING": {
       "B": {
-        "BREAK_SNACK": "Enjoy your break!",
+        "END_BREAK": "End break",
         "PAUSE_AND_BREAK": "Pause & take a break",
         "SNOOZE": "Snooze {{time}}"
       },

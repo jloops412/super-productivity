@@ -1,4 +1,5 @@
 import { Injectable, inject } from '@angular/core';
+import { takeUntilDestroyed, toObservable } from '@angular/core/rxjs-interop';
 import { TaskService } from '../tasks/task.service';
 import { GlobalTrackingIntervalService } from '../../core/global-tracking-interval/global-tracking-interval.service';
 import { EMPTY, from, merge, Observable, of, Subject, timer } from 'rxjs';
@@ -12,6 +13,7 @@ import {
   shareReplay,
   startWith,
   switchMap,
+  take,
   throttleTime,
   withLatestFrom,
 } from 'rxjs/operators';
@@ -31,7 +33,9 @@ import { ofType } from '@ngrx/effects';
 import { idleDialogResult, triggerResetBreakTimer } from '../idle/store/idle.actions';
 import { playSound } from '../../util/play-sound';
 import { LOCAL_ACTIONS } from '../../util/local-actions.token';
-import { SnackService } from '../../core/snack/snack.service';
+import { BreakTimerService } from './break-timer.service';
+import { WorkContextService } from '../work-context/work-context.service';
+import { Log } from '../../core/log';
 
 const BREAK_TRIGGER_DURATION = 10 * 60 * 1000;
 const PING_UPDATE_BANNER_INTERVAL = 60 * 1000;
@@ -61,7 +65,16 @@ export class TakeABreakService {
   private _bannerService = inject(BannerService);
   private _chromeExtensionInterfaceService = inject(ChromeExtensionInterfaceService);
   private _uiHelperService = inject(UiHelperService);
-  private _snackService = inject(SnackService);
+  private _breakTimerService = inject(BreakTimerService);
+  private _workContextService = inject(WorkContextService);
+
+  readonly isBreakActive = this._breakTimerService.isActive;
+  readonly breakElapsed = this._breakTimerService.elapsed;
+  readonly breakRemaining = this._breakTimerService.remaining;
+  readonly breakProgress = this._breakTimerService.progress;
+
+  private readonly _breakRemaining$ = toObservable(this.breakRemaining);
+  private readonly _breakProgress$ = toObservable(this.breakProgress);
 
   otherNoBreakTIme$ = new Subject<number>();
 
@@ -309,6 +322,21 @@ export class TakeABreakService {
             : undefined,
       });
     });
+
+    toObservable(this._breakTimerService.isTargetReached)
+      .pipe(distinctUntilChanged(), filter(Boolean), takeUntilDestroyed())
+      .subscribe(() => this._handleBreakTargetReached());
+
+    this._taskService.currentTaskId$
+      .pipe(
+        filter((taskId): taskId is string => !!taskId),
+        takeUntilDestroyed(),
+      )
+      .subscribe(() => {
+        if (this.isBreakActive()) {
+          this.endBreak();
+        }
+      });
   }
 
   snooze(snoozeTime: number = 15 * 60 * 1000): void {
@@ -322,16 +350,66 @@ export class TakeABreakService {
   }
 
   startBreak(): void {
-    // This reminder isn't a timed-break feature: it just pauses tracking so the
-    // rest counts as a break, then resets the reminder. Show an encouraging
-    // snack so the click clearly does something instead of nothing.
+    if (this.isBreakActive()) {
+      return;
+    }
+
+    const targetDuration =
+      this._configService.takeABreak()?.takeABreakSnoozeTime ?? 15 * 60 * 1000;
+    this._breakTimerService.start(targetDuration);
     this._taskService.pauseCurrent();
-    this._snackService.open({
-      type: 'SUCCESS',
-      ico: 'free_breakfast',
-      msg: T.F.TIME_TRACKING.B.BREAK_SNACK,
-    });
     this.resetTimer();
+    this._openActiveBreakBanner();
+  }
+
+  endBreak(): void {
+    if (!this.isBreakActive()) {
+      return;
+    }
+
+    const elapsed = this._breakTimerService.stop();
+    this._bannerService.dismiss(BANNER_ID);
+    if (elapsed <= 0) {
+      return;
+    }
+
+    void this._recordBreak(elapsed);
+  }
+
+  private _openActiveBreakBanner(isTargetReached = false): void {
+    this._bannerService.open({
+      id: BANNER_ID,
+      ico: 'free_breakfast',
+      msg: isTargetReached ? T.F.POMODORO.BREAK_IS_DONE : T.F.FOCUS_MODE.B.BREAK_RUNNING,
+      timer$: this._breakRemaining$,
+      progress$: this._breakProgress$,
+      isHideDismissBtn: true,
+      action: {
+        label: T.F.TIME_TRACKING.B.END_BREAK,
+        fn: () => this.endBreak(),
+      },
+    });
+  }
+
+  private _handleBreakTargetReached(): void {
+    this._openActiveBreakBanner(true);
+    this._configService.sound$.pipe(take(1)).subscribe((soundCfg) => {
+      if (soundCfg.breakReminderSound) {
+        playSound(soundCfg.breakReminderSound as string);
+      }
+    });
+    void this._notifyService.notify({
+      tag: 'TAKE_A_BREAK_DONE',
+      title: T.F.POMODORO.BREAK_IS_DONE,
+    });
+  }
+
+  private async _recordBreak(elapsed: number): Promise<void> {
+    try {
+      await this._workContextService.addToBreakTimeForActiveContext(undefined, elapsed);
+    } catch (error) {
+      Log.err('Unable to record manual break', error);
+    }
   }
 
   private _createMessage(duration: number, cfg: TakeABreakConfig): string | undefined {
